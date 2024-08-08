@@ -97,15 +97,13 @@ def has_option(name):
 
 
 def use_system_version_of_library(name):
-    return has_option("use-system-all") or has_option("use-system-" + name)
+    # Disabled during Bazel migration
+    return False
 
 
-# Returns true if we have been configured to use a system version of any C++ library. If you
-# add a new C++ library dependency that may be shimmed out to the system, add it to the below
-# list.
 def using_system_version_of_cxx_libraries():
-    cxx_library_names = ["tcmalloc-google", "boost", "tcmalloc-gperf"]
-    return True in [use_system_version_of_library(x) for x in cxx_library_names]
+    # Disabled during Bazel migration
+    return False
 
 
 def make_variant_dir_generator():
@@ -190,6 +188,12 @@ add_option(
     default="all",
     type="choice",
     help="Lint files in the current git diff instead of all files",
+)
+
+add_option(
+    "bazel-includes-info",
+    help="write included headers in bazel label format to put files ([library].bazel_includes)",
+    default="",
 )
 
 add_option(
@@ -464,6 +468,18 @@ add_option(
 )
 
 add_option(
+    "pgo-profile",
+    help="compile with pgo profiling",
+    nargs=0,
+)
+
+add_option(
+    "pgo",
+    help="compile with pgo. Assumes profile file default.profdata at root of repository",
+    nargs=0,
+)
+
+add_option(
     "enable-http-client",
     choices=["auto", "on", "off"],
     default="auto",
@@ -491,65 +507,6 @@ add_option(
     default="off",
     help="Enable tracing profiler statistic collection",
     type="choice",
-)
-
-# Most of the "use-system-*" options follow a simple form.
-for pack in [
-    (
-        "asio",
-        "ASIO",
-    ),
-    ("boost",),
-    ("fmt",),
-    ("google-benchmark", "Google benchmark"),
-    ("grpc",),
-    ("icu", "ICU"),
-    ("intel_decimal128", "intel decimal128"),
-    ("bson",),
-    ("libmongocrypt",),
-    ("tomcrypt",),
-    ("pcre2",),
-    ("protobuf", "Protocol Buffers"),
-    ("snappy",),
-    ("stemmer",),
-    ("tcmalloc-google",),
-    ("tcmalloc-gperf",),
-    ("libunwind",),
-    ("valgrind",),
-    ("wiredtiger",),
-    ("yaml",),
-    ("zlib",),
-    ("zstd", "Zstandard"),
-]:
-    name = pack[0]
-    pretty = name
-    if len(pack) == 2:
-        pretty = pack[1]
-    add_option(
-        f"use-system-{name}",
-        help=f"use system version of {pretty} library",
-        nargs=0,
-    )
-
-add_option(
-    "system-boost-lib-search-suffixes",
-    help="Comma delimited sequence of boost library suffixes to search",
-)
-
-add_option(
-    "use-system-mongo-c",
-    choices=["on", "off", "auto"],
-    const="on",
-    default="auto",
-    help="use system version of the mongo-c-driver (auto will use it if it's found)",
-    nargs="?",
-    type="choice",
-)
-
-add_option(
-    "use-system-all",
-    help="use all system libraries",
-    nargs=0,
 )
 
 add_option(
@@ -1912,6 +1869,16 @@ if unknown_vars:
     env.FatalError("Unknown variables specified: {0}", ", ".join(list(unknown_vars.keys())))
 
 install_actions.setup(env, get_option("install-action"))
+
+
+if env.TargetOSIs("windows") and os.path.exists(
+    env.File("#/src/mongo/db/modules/enterprise/SConscript").abspath
+):
+    # the sasl zip can be rebuilt by following the instructions at:
+    # https://github.com/mongodb-forks/cyrus-sasl/blob/mongo-sasl-2-1-28/README.md
+    import mongo.download_windows_sasl
+
+    mongo.download_windows_sasl.download_sasl(env)
 
 detectEnv = env.Clone()
 
@@ -3406,20 +3373,6 @@ if not env.TargetOSIs("windows", "macOS") and (env.ToolchainIs("GCC", "clang")):
             ):
                 env.Append(CCFLAGS=[f"{targeting_flag}{targeting_flag_value}"])
 
-# boostSuffixList is used when using system boost to select a search sequence
-# for boost libraries.
-boostSuffixList = ["-mt", ""]
-if get_option("system-boost-lib-search-suffixes") is not None:
-    if not use_system_version_of_library("boost"):
-        env.FatalError(
-            "The --system-boost-lib-search-suffixes option is only valid " "with --use-system-boost"
-        )
-    boostSuffixList = get_option("system-boost-lib-search-suffixes")
-    if boostSuffixList == "":
-        boostSuffixList = []
-    else:
-        boostSuffixList = boostSuffixList.split(",")
-
 # discover modules, and load the (python) module for each module's build.py
 mongo_modules = moduleconfig.discover_modules("src/mongo/db/modules", get_option("modules"))
 
@@ -4740,15 +4693,42 @@ def doConfigure(myenv):
                 myenv.ConfError("Failed to enable thin LTO")
 
         if linker_ld != "gold" and not env.TargetOSIs("darwin", "macOS"):
-            myenv.AppendUnique(
-                CCFLAGS=["-ffunction-sections"],
-                LINKFLAGS=[
-                    "-Wl,--symbol-ordering-file=symbols.orderfile",
-                    "-Wl,--no-warn-symbol-ordering",
-                ],
-            )
+            if has_option("pgo"):
+                print("WARNING: skipping symbol ordering as pgo is enabled")
+            else:
+                myenv.AppendUnique(
+                    CCFLAGS=["-ffunction-sections"],
+                    LINKFLAGS=[
+                        "-Wl,--symbol-ordering-file=symbols.orderfile",
+                        "-Wl,--no-warn-symbol-ordering",
+                    ],
+                )
         else:
             print("WARNING: lld linker is required to sort symbols")
+
+        if has_option("pgo-profile"):
+            if (
+                not myenv.ToolchainIs("clang")
+                or not myenv.TargetOSIs("linux")
+                or linker_ld == "gold"
+            ):
+                myenv.FatalError("Error: pgo only works on linux with clang + lld")
+            myenv.AppendUnique(
+                CCFLAGS=["-fprofile-instr-generate"],
+                LINKFLAGS=["-fprofile-instr-generate"],
+            )
+
+        if has_option("pgo"):
+            if (
+                not myenv.ToolchainIs("clang")
+                or not myenv.TargetOSIs("linux")
+                or linker_ld == "gold"
+            ):
+                myenv.FatalError("Error: pgo only works on linux with clang + lld")
+            myenv.AppendUnique(
+                _NON_CONF_CCFLAGS_GEN=["-fprofile-use=./default.profdata"],
+            )
+            myenv["CCFLAGS_WERROR"].remove("-Werror")
 
         # As far as we know these flags only apply on posix-y systems,
         # and not on Darwin.
@@ -5257,26 +5237,6 @@ def doConfigure(myenv):
             ]
         )
 
-    if use_system_version_of_library("boost"):
-        if not conf.CheckCXXHeader("boost/filesystem/operations.hpp"):
-            myenv.ConfError("can't find boost headers")
-        if not conf.CheckBoostMinVersion():
-            myenv.ConfError("system's version of boost is too old. version 1.49 or better required")
-
-        # Note that on Windows with using-system-boost builds, the following
-        # FindSysLibDep calls do nothing useful (but nothing problematic either)
-        #
-        # NOTE: Pass --system-boost-lib-search-suffixes= to suppress these checks, which you
-        # might want to do if using autolib linking on Windows, for example.
-        if boostSuffixList:
-            for b in boostLibs:
-                boostlib = "boost_" + b
-                conf.FindSysLibDep(
-                    boostlib,
-                    [boostlib + suffix for suffix in boostSuffixList],
-                    language="C++",
-                )
-
     if use_system_version_of_library("protobuf"):
         conf.FindSysLibDep("protobuf", ["protobuf"])
         conf.FindSysLibDep("protoc", ["protoc"])
@@ -5382,21 +5342,7 @@ def doConfigure(myenv):
 
     conf.AddTest("CheckMongoCMinVersion", CheckMongoCMinVersion)
 
-    mongoc_mode = get_option("use-system-mongo-c")
     conf.env["MONGO_HAVE_LIBMONGOC"] = False
-    if mongoc_mode != "off":
-        if conf.CheckLibWithHeader(
-            ["mongoc-1.0"],
-            ["mongoc/mongoc.h"],
-            "C",
-            "mongoc_get_major_version();",
-            autoadd=False,
-        ):
-            conf.env["MONGO_HAVE_LIBMONGOC"] = True
-        if not conf.env["MONGO_HAVE_LIBMONGOC"] and mongoc_mode == "on":
-            myenv.ConfError("Failed to find the required C driver headers")
-        if conf.env["MONGO_HAVE_LIBMONGOC"] and not conf.CheckMongoCMinVersion():
-            myenv.ConfError("Version of mongoc is too old. Version 1.13+ required")
 
     # ask each module to configure itself and the build environment.
     moduleconfig.configure_modules(mongo_modules, conf)
@@ -6608,6 +6554,88 @@ clang_tidy_config = env.Substfile(
     SUBST_DICT=replacements,
 )
 env.Alias("generated-sources", clang_tidy_config)
+
+if get_option("bazel-includes-info"):
+    target_library = get_option("bazel-includes-info").replace("\\", "/")
+
+    def bazel_includes_emitter(target, source, env):
+        rel_target = os.path.relpath(str(target[0].abspath), start=env.Dir("#").abspath).replace(
+            "\\", "/"
+        )
+
+        if rel_target == target_library:
+            objsuffix = (
+                env.subst("$OBJSUFFIX")
+                if not env.TargetOSIs("linux")
+                else env.subst("$SHOBJSUFFIX")
+            )
+            builder_name = (
+                "StaticLibrary" if not env.TargetOSIs("linux") == "nt" else "SharedLibrary"
+            )
+            os.makedirs(os.path.dirname(str(target[0].abspath)), exist_ok=True)
+            with open(str(target[0].abspath) + ".obj_files", "w") as f:
+                for s in source:
+                    if str(s).endswith(objsuffix):
+                        f.write(os.path.relpath(str(s.abspath), start=env.Dir("#").abspath) + "\n")
+            with open(str(target[0].abspath) + ".env_vars", "w") as f:
+                json.dump(env["ENV"], f)
+            with open(str(target[0].abspath) + ".bazel_headers", "w") as f:
+                # note we can't know about LIBDEPS_DEPDENDENTS (reverse deps) in an emitter
+                # however we do co-opt the libdeps linter to check for these at the end of reading
+                # sconscripts
+                for s in (
+                    env.get("LIBDEPS", [])
+                    + env.get("LIBDEPS_PRIVATE", [])
+                    + env.get("LIBDEPS_INTERFACE", [])
+                ):
+                    if not s:
+                        continue
+
+                    libnode = libdeps._get_node_with_ixes(env, s, builder_name)
+
+                    libnode_path = os.path.relpath(
+                        str(libnode.abspath), start=env.Dir("#").abspath
+                    ).replace("\\", "/")
+                    if (
+                        libnode.has_builder()
+                        and libnode.get_builder().get_name(env) != "ThinTarget"
+                    ):
+                        print(
+                            f"ERROR: can generate correct bazel header list because {target[0]} has non-bazel dependency: {libnode}"
+                        )
+                        sys.exit(1)
+                    if str(libnode_path) in env["SCONS2BAZEL_TARGETS"].scons2bazel_targets:
+                        bazel_target = env["SCONS2BAZEL_TARGETS"].bazel_target(str(libnode_path))
+                        # new query to run, run and cache it
+                        bazel_query = (
+                            ["cquery"]
+                            + env["BAZEL_FLAGS_STR"]
+                            + [
+                                f'filter("[\\.h,\\.ipp,\\.hpp].*$", kind("source", deps(@{bazel_target})))',
+                                "--output",
+                                "files",
+                            ]
+                        )
+                        results = env.RunBazelQuery(bazel_query, "getting bazel headers")
+
+                        if results.returncode != 0:
+                            print("ERROR: bazel libdeps query failed:")
+                            print(results)
+                            sys.exit(1)
+                        results = set(
+                            [line for line in results.stdout.split("\n") if line.startswith("src/")]
+                        )
+
+                        for header in results:
+                            f.write(header + "\n")
+
+        return target, source
+
+    for builder_name in ["SharedLibrary", "StaticLibrary", "Program"]:
+        builder = env["BUILDERS"][builder_name]
+        base_emitter = builder.emitter
+        new_emitter = SCons.Builder.ListEmitter([base_emitter, bazel_includes_emitter])
+        builder.emitter = new_emitter
 
 env.SConscript(
     dirs=[

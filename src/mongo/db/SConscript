@@ -246,16 +246,6 @@ env.Library(
     ],
 )
 
-env.Library(
-    target="profile_filter",
-    source=[
-        "profile_filter.cpp",
-    ],
-    LIBDEPS=[
-        "$BUILD_DIR/mongo/base",
-    ],
-)
-
 env.Benchmark(
     target="profile_filter_bm",
     source=[
@@ -1690,9 +1680,6 @@ execEnv.Library(
         "query/stage_builder/classic_stage_builder.cpp",
         "query/cost_model/on_coefficients_change_updater_impl.cpp",
         "query/cqf_command_utils.cpp",
-        "query/cqf_fast_paths.cpp",
-        "query/cqf_fast_paths_utils.cpp",
-        "query/cqf_get_executor.cpp",
         "query/explain.cpp",
         "query/find.cpp",
         "query/get_executor.cpp",
@@ -1794,11 +1781,7 @@ execEnv.Library(
         "pipeline/change_stream_pipeline",
         "pipeline/document_source_internal_apply_oplog_update",
         "pipeline/pipeline_visitor",
-        "query/ce/query_ce_heuristic",
-        "query/ce/query_ce_histogram",
-        "query/ce/query_ce_sampling",
-        "query/ce/query_ce_sampling_executor",
-        "query/optimizer/optimizer",
+        "query/optimizer/optimizer_rewrites",
         "record_id_helpers",
         "repl/repl_coordinator_interface",
         "repl/wait_for_majority_service",
@@ -2505,7 +2488,7 @@ env.Library(
         else [],
         "$BUILD_DIR/mongo/util/version_impl",
         "$BUILD_DIR/mongo/watchdog/watchdog_mongod",
-        "$BUILD_DIR/third_party/shim_snappy",
+        "$BUILD_DIR/third_party/snappy/snappy",
         "admission/queues_server_status_section",
         "auth/auth_op_observer",
         "auth/authserver",
@@ -3107,6 +3090,6 @@ bmEnv.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
-        "$BUILD_DIR/third_party/shim_benchmark",
+        "$BUILD_DIR/third_party/benchmark/benchmark",
     ],
 )

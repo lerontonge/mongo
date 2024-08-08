@@ -111,9 +111,6 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/collection_query_info.h"
-#include "mongo/db/query/cqf_command_utils.h"
-#include "mongo/db/query/cqf_fast_paths.h"
-#include "mongo/db/query/cqf_get_executor.h"
 #include "mongo/db/query/eof_node_type.h"
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/query/index_bounds.h"
@@ -431,22 +428,6 @@ public:
         invariant(_cq);
         if (shouldLog(MONGO_LOGV2_DEFAULT_COMPONENT, logv2::LogSeverity::Debug(2))) {
             _queryStringForDebugLog = _cq->toStringShort();
-        }
-    }
-
-    /**
-     * When the instance of this class goes out of scope the trials for multiplanner are completed.
-     */
-    virtual ~PrepareExecutionHelper() {
-        if (_opCtx) {
-            if (auto curOp = CurOp::get(_opCtx)) {
-
-                LOGV2_DEBUG(8276400,
-                            4,
-                            "Stopping the planningTime timer",
-                            "query"_attr = redact(_queryStringForDebugLog));
-                curOp->stopQueryPlanningTimer();
-            }
         }
     }
 
@@ -1145,42 +1126,6 @@ boost::optional<ScopedCollectionFilter> getScopedCollectionFilter(
     return boost::none;
 }
 
-boost::optional<ExecParams> tryGetBonsaiParams(OperationContext* opCtx,
-                                               CanonicalQuery* canonicalQuery,
-                                               const MultipleCollectionAccessor& collections) {
-    auto eligibility =
-        determineBonsaiEligibility(opCtx, collections.getMainCollection(), *canonicalQuery);
-    const bool hasExplain = canonicalQuery->getExplain().has_value();
-    if (!isEligibleForBonsaiUnderFrameworkControl(
-            canonicalQuery->getExpCtx(), hasExplain, eligibility)) {
-        return boost::none;
-    }
-
-    // If the query is eligible for a fast path, use the fast path plan instead of
-    // invoking the optimizer.
-    if (auto execParams =
-            optimizer::fast_path::tryGetSBEExecutorViaFastPath(collections, canonicalQuery)) {
-        return execParams;
-    }
-
-    auto queryHints = getHintsFromQueryKnobs();
-    const bool fastIndexNullHandling = queryHints._fastIndexNullHandling;
-    if (auto execParams = getSBEExecutorViaCascadesOptimizer(
-            collections, std::move(queryHints), eligibility, canonicalQuery)) {
-        return execParams;
-    }
-
-    auto queryControl = canonicalQuery->getExpCtx()
-                            ->getQueryKnobConfiguration()
-                            .getInternalQueryFrameworkControlForOp();
-    auto hasHint = !canonicalQuery->getFindCommandRequest().getHint().isEmpty();
-    tassert(7319400,
-            "Optimization failed either with forceBonsai set, or without a hint.",
-            queryControl != QueryFrameworkControlEnum::kForceBonsai && hasHint &&
-                !fastIndexNullHandling);
-    return boost::none;
-}
-
 std::unique_ptr<PlanYieldPolicySBE> tryGetSbeParams(OperationContext* opCtx,
                                                     CanonicalQuery* canonicalQuery,
                                                     const MultipleCollectionAccessor& collections,
@@ -1247,6 +1192,11 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind
             });
     };
 
+    ON_BLOCK_EXIT([&] {
+        // Stop the query planning timer once we have an execution plan.
+        CurOp::get(opCtx)->stopQueryPlanningTimer();
+    });
+
     // First try to use the express id point query fast path.
     const auto& mainColl = collections.getMainCollection();
     const auto expressEligibility = isExpressEligible(opCtx, mainColl, *canonicalQuery);
@@ -1293,6 +1243,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind
                 *indexEntry,
                 getScopedCollectionFilter(opCtx, collections, *paramsForSingleCollectionQuery),
                 plannerOptions & QueryPlannerParams::RETURN_OWNED_DATA);
+
             setCurOpQueryFramework(expressExecutor.get());
             return std::move(expressExecutor);
         }
@@ -1300,16 +1251,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind
 
     // Set whether the query is suitable for SBE. This will be later needed for eligibility checks.
     canonicalQuery->setSbeCompatible(isQuerySbeCompatible(&mainColl, canonicalQuery.get()));
-
-    // Next try to use Bonsai if eligible.
-    if (auto execParams = tryGetBonsaiParams(opCtx, canonicalQuery.get(), collections)) {
-        auto executor = uassertStatusOK(makeExecFromParams(std::move(canonicalQuery),
-                                                           /* pipeline */ nullptr,
-                                                           collections,
-                                                           std::move(*execParams)));
-        setCurOpQueryFramework(executor.get());
-        return std::move(executor);
-    }
 
     // None of the previous paths are viable, so generate one of the following three plan executor
     // planners:
@@ -1516,6 +1457,11 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
                           << "Not primary while removing from " << nss.toStringForErrorMsg());
     }
 
+    ON_BLOCK_EXIT([&] {
+        // Stop the query planning timer once we have an execution plan.
+        CurOp::get(opCtx)->stopQueryPlanningTimer();
+    });
+
     if (!collectionPtr) {
         std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
 
@@ -1526,6 +1472,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
                     "Collection does not exist. Using EOF stage",
                     logAttrs(nss),
                     "query"_attr = redact(request->getQuery()));
+
         return plan_executor_factory::make(
             expCtx,
             std::move(ws),
@@ -1598,10 +1545,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
         deleteStageParams->numStatsForDoc = timeseries::numMeasurementsForBucketCounter(
             collectionPtr->getTimeseriesOptions()->getTimeField());
     }
-
-    uassert(ErrorCodes::InternalErrorNotSupported,
-            "delete command is not eligible for bonsai",
-            !isEligibleForBonsai(opCtx, collectionPtr, *cq));
 
     // Transfer the explain verbosity level into the expression context.
     cq->getExpCtx()->explain = verbosity;
@@ -1690,6 +1633,10 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpda
         return UpdateStageParams::DocumentCounter{};
     }();
 
+    ON_BLOCK_EXIT([&] {
+        // Stop the query planning timer once we have an execution plan.
+        CurOp::get(opCtx)->stopQueryPlanningTimer();
+    });
 
     // If the collection doesn't exist, then return a PlanExecutor for a no-op EOF plan. We have
     // should have already enforced upstream that in this case either the upsert flag is false, or
@@ -1702,6 +1649,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpda
                     "Collection does not exist. Using EOF stage",
                     logAttrs(nss),
                     "query"_attr = redact(request->getQuery()));
+
         return plan_executor_factory::make(
             expCtx,
             std::move(ws),
@@ -1731,6 +1679,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpda
                      clustered_util::isClusteredOnId(collectionPtr->getClusteredInfo()))) {
                     // Upserts not supported in express for now.
                     LOGV2_DEBUG(83759, 2, "Using Express", "query"_attr = redact(unparsedQuery));
+
                     return makeExpressExecutorForUpdate(
                         opCtx, coll, parsedUpdate, false /* return owned BSON */);
 
@@ -1762,10 +1711,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpda
     UpdateStageParams updateStageParams(request, driver, opDebug, std::move(documentCounter));
     std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
     std::unique_ptr<CanonicalQuery> cq(parsedUpdate->releaseParsedQuery());
-
-    uassert(ErrorCodes::InternalErrorNotSupported,
-            "update command is not eligible for bonsai",
-            !isEligibleForBonsai(opCtx, collectionPtr, *cq));
 
     std::unique_ptr<projection_ast::Projection> projection;
     if (!request->getProj().isEmpty()) {
@@ -1993,9 +1938,10 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCoun
     const auto skip = request.getSkip().value_or(0);
     const auto limit = request.getLimit().value_or(0);
 
-    uassert(ErrorCodes::InternalErrorNotSupported,
-            "count command is not eligible for bonsai",
-            !isEligibleForBonsai(opCtx, collection, *cq));
+    ON_BLOCK_EXIT([&] {
+        // Stop the query planning timer once we have an execution plan.
+        CurOp::get(opCtx)->stopQueryPlanningTimer();
+    });
 
     if (!collection) {
         // Treat collections that do not exist as empty collections. Note that the explain reporting
@@ -2008,6 +1954,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCoun
             skip,
             ws.get(),
             new EOFStage(expCtx.get(), eof_node::EOFType::NonExistentNamespace));
+
         return plan_executor_factory::make(expCtx,
                                            std::move(ws),
                                            std::move(root),
@@ -2030,6 +1977,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCoun
     if (useRecordStoreCount) {
         std::unique_ptr<PlanStage> root =
             std::make_unique<RecordStoreFastCountStage>(expCtx.get(), &collection, skip, limit);
+
         return plan_executor_factory::make(expCtx,
                                            std::move(ws),
                                            std::move(root),
@@ -2312,10 +2260,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> tryGetExecutorD
     const auto& canonicalQuery = *canonicalDistinct.getQuery();
     auto* opCtx = canonicalQuery.getExpCtx()->opCtx;
 
-    uassert(ErrorCodes::InternalErrorNotSupported,
-            "distinct command is not eligible for bonsai",
-            !isEligibleForBonsai(opCtx, collectionPtr, canonicalQuery));
-
     auto getQuerySolution = [&](size_t options) -> std::unique_ptr<QuerySolution> {
         auto plannerParams =
             std::make_unique<QueryPlannerParams>(QueryPlannerParams::ArgsForDistinct{
@@ -2350,6 +2294,10 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> tryGetExecutorD
 
     auto cq = canonicalDistinct.releaseQuery();
     LOGV2_DEBUG(20932, 2, "Using fast distinct", "query"_attr = redact(cq->toStringShort()));
+
+    // Stop the query planning timer once we have an execution plan.
+    CurOp::get(opCtx)->stopQueryPlanningTimer();
+
     return plan_executor_factory::make(std::move(cq),
                                        std::move(ws),
                                        std::move(root),
